@@ -6,6 +6,7 @@ import framebufferio
 import adafruit_lis3dh # Accelerometer
 import busio
 import digitalio
+import usb_cdc
 
 # Graphic imports
 import adafruit_imageload
@@ -32,171 +33,71 @@ import wifi
 import socketpool
 import adafruit_requests
 
+# Settings
+DEBUG = True
 WIDTH = 64
 HEIGHT = 64
+WIFI_CHECK_INTERVAL_SEC = 120
+ISS_UPDATE_INTERVAL_SEC = 60
+TIME_UPDATE_INTERVAL_SEC = 3600
 
-# ISS tracking variables
-iss_lat = None
-iss_lon = None
-last_iss_update = 0
-iss_update_interval_sec = 60
+################################################################################
+# Functions
 
-# Time update variables
-last_time_update = 0
-last_time_display_update = 0
-time_update_interval_sec = 3600
+def debug_print(*args, **kwargs):
+    """Prevent printing when serial is disconnected"""
+    if DEBUG:
+        try:
+            print(*args, **kwargs)
+        except:
+            pass
 
-# Realtime clock
-local_rtc = rtc.RTC()
-
-# Hardware button setup
-down_button = digitalio.DigitalInOut(board.BUTTON_DOWN)
-down_button.direction = digitalio.Direction.INPUT
-down_button.pull = digitalio.Pull.UP # Value False when button presed
-
-up_button = digitalio.DigitalInOut(board.BUTTON_UP)
-up_button.direction = digitalio.Direction.INPUT
-up_button.pull = digitalio.Pull.UP # Value False when button presed
-
-# --- Display Setup --- #
-displayio.release_displays()
-# RGB Matrix initialization
-matrix = rgbmatrix.RGBMatrix(
-    width=WIDTH, height=HEIGHT, bit_depth=5,
-    rgb_pins=[board.MTX_R1, board.MTX_G1, board.MTX_B1,
-              board.MTX_R2, board.MTX_G2, board.MTX_B2],
-    addr_pins=[board.MTX_ADDRA, board.MTX_ADDRB, board.MTX_ADDRC,
-               board.MTX_ADDRD, board.MTX_ADDRE],
-    clock_pin=board.MTX_CLK, latch_pin=board.MTX_LAT, output_enable_pin=board.MTX_OE,
-    doublebuffer=False)
-
-display = framebufferio.FramebufferDisplay(matrix,auto_refresh=False, rotation=90) # Rotate 90 degrees so PCB pokes out of the top
-display.brightness = 1 # Current implementation is 0 = off anything non-zero value = full brightness
-
-# Main "Full color" bitmap we use for drawing onto
-bitmap = displayio.Bitmap(WIDTH,HEIGHT,65535)
-cc = displayio.ColorConverter(input_colorspace=displayio.Colorspace.RGB565)
-tg1 = displayio.TileGrid(bitmap,pixel_shader=cc)
-g1 = displayio.Group(scale=1)
-g1.append(tg1)
-
-# Default palette for sprite mode - may get overwritten in special initialization
-palette = displayio.Palette(256)
-palette[0] = 0x0
-palette[1] = 0xf80000
-palette[2] = 0xf8f8f8
-palette[3] = 0xf8
-palette[4] = 0xf8f8
-palette[5] = 0xf8c8e0
-palette[6] = 0xf89800
-palette[7] = 0xf8f800
-palette[8] = 0x983800
-palette[9] = 0xf800
-palette[10] = 0xf8e0c0
-palette[11] = 0xf8e860
-palette[12] = 0xffff80
-palette[13] = 0xff0000
-palette[14] = 0xf8e0f8
-palette.make_transparent(0)
-
-# Palettized bitmap layer for sprite mode - in front of regular bitmap layer
-palettized_bitmap = displayio.Bitmap(WIDTH,HEIGHT,256)
-tg2 = displayio.TileGrid(palettized_bitmap,pixel_shader=palette)
-#g1.append(tg2) # Comment this line out if not using this layer (for faster updates)
-
-# Set root display object
-display.root_group = g1
-display.refresh()
-
-# Perfomance tracking
-fps_sum = 0
-fps_samples = 0
-fps_start = -1
-last_print_time = 0
-last_fps = 0
-
-# We want to control when the screen updates
-display.auto_refresh = False
-display.refresh()
-
-use_wifi = True
-
-if use_wifi:
-    # Get connected to the internet!
-    print(f"My MAC address: {[hex(i) for i in wifi.radio.mac_address]}") # show our MAC
-
-    # Show which WiFi networks we can see (comment this back in to survey the wifi in your area)
-    # wifi.radio.stop_scanning_networks()
-    # for network in wifi.radio.start_scanning_networks():
-    #     print("\t%s\t\tRSSI: %d\tChannel: %d" % (str(network.ssid, "utf-8"),
-    #                                              network.rssi, network.channel))
-    # wifi.radio.stop_scanning_networks() # stop scanning
-
-    # Connect the specified access point in the TOML file
-    print( f"WiFi Connecting to {os.getenv("CIRCUITPY_WIFI_SSID")}" )
+def is_wifi_connected():
+    """Return True if we have a valid IP address, False otherwise."""
     try:
-        wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"),os.getenv("CIRCUITPY_WIFI_PASSWORD"))
-    except Exception as e:
-        print(f"Could not connect to {os.getenv("CIRCUITPY_WIFI_SSID")}" )
-        
-    # Set up objects so we can do Web API requests
-    pool = socketpool.SocketPool(wifi.radio)
-    requests = adafruit_requests.Session(pool, ssl.create_default_context())
+        return wifi.radio.ipv4_address is not None
+    except Exception:
+        return False
 
-    # Grab the current time via the timeapi.io API (set a timeout so we don't wait forever)
-    print( f"CircuitPython thinks the time/date is {adafruit_datetime.datetime.today()}\nGetting time from API" )
-    try:
-        response = requests.request("GET", "https://www.timeapi.io/api/timezone/zone?timeZone=America%2FLos_Angeles", timeout=2 )
-        """ example response
-        {
-          "timeZone": "America/Los_Angeles",
-          "currentLocalTime": "2025-08-18T17:15:28.519488",
-          ...
-        }
-          """
-        if response.status_code == 200:
-            print("Got time from API - Parsing")
-            # parse the JSON
-        #    print( f"Response was:\n{response.json()}" )
-            timestring = response.json()['currentLocalTime']
-            # knock off the fractional seconds to prevent exceptions in the parser
-            timestring = timestring.split('.')[0]
-            local_rtc.datetime = adafruit_datetime.datetime.fromisoformat(timestring).timetuple() # Convert to actual datetime object and set the controller's time
-            print( f"Updating local timesource to {timestring}" )
-        else:
-            print("Get response was {response}")
-    except Exception as e:
-        print(f"API check failed {e}")
-
-# Load the world map image
-try:
-    world_map_bitmap, world_map_palette = adafruit_imageload.load("/world_map.png",
-                                                                    bitmap=displayio.Bitmap,
-                                                                    palette=displayio.Palette)
-    print("World map loaded successfully")
-except Exception as e:
-    print(f"Error loading world map: {e}")
-    world_map_bitmap = None
+def reconnect_wifi(max_retries=3, delay=5):
+    """Attempt to reconnect to Wi-Fi if disconnected."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"Reconnecting Wi-Fi (attempt {attempt})...")
+            wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"), os.getenv("CIRCUITPY_WIFI_PASSWORD"))
+            print("Reconnected:", wifi.radio.ipv4_address)
+            return True
+        except Exception as e:
+            print("Reconnect failed:", e)
+            time.sleep(delay)
+    print("Failed to reconnect after multiple attempts.")
+    return False
 
 def get_iss_position(requests):
     """
     Fetch the current ISS position from the API
     Returns: (latitude, longitude) tuple or None if failed
     """
-    try:
-        response = requests.get("http://api.open-notify.org/iss-now.json", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            lat = float(data['iss_position']['latitude'])
-            lon = float(data['iss_position']['longitude'])
-            print(f"ISS Position: Lat {lat}, Lon {lon}")
-            return (lat, lon)
-        else:
-            print(f"ISS API returned status code: {response.status_code}")
-            return None
-    except Exception as e:
-        print(f"Error fetching ISS position: {e}")
-        return None
+    url = "http://api.open-notify.org/iss-now.json"
+
+    for attempt in range(3):  # retry up to 3 times
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                lat = float(data['iss_position']['latitude'])
+                lon = float(data['iss_position']['longitude'])
+                debug_print(f"ISS Position: Lat {lat}, Lon {lon}")
+                response.close()
+                return (lat, lon)
+            else:
+                debug_print(f"ISS API returned status code: {response.status_code}")
+        except Exception as e:
+            debug_print(f"Error fetching ISS position (attempt {attempt + 1}): {e}")
+            if not is_wifi_connected():
+                reconnect_wifi()
+            time.sleep(2)
+    return None
 
 def latlon_to_pixel(latitude, longitude, width=64, height=64):
     """
@@ -231,118 +132,279 @@ def latlon_to_pixel(latitude, longitude, width=64, height=64):
     
     return (x, y)
 
-def get_time_from_api(requests):
+def get_time_from_api(requests, local_rtc):
     """
     Fetch current time from timeapi.io
     Returns: True if successful, False otherwise
     """
-    try:
-        response = requests.request("GET", "https://www.timeapi.io/api/timezone/zone?timeZone=America%2FLos_Angeles", timeout=5)
-        if response.status_code == 200:
-            print("Got time from API - Parsing")
-            timestring = response.json()['currentLocalTime']
-            timestring = timestring.split('.')[0]
-            local_rtc.datetime = adafruit_datetime.datetime.fromisoformat(timestring).timetuple()
-            print(f"Updated time to: {timestring}")
-            return True
-        else:
-            print(f"Time API returned status code: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"Time API check failed: {e}")
-        return False
+    url = "https://www.timeapi.io/api/timezone/zone?timeZone=America%2FLos_Angeles"
 
-# Use the main bitmap for drawing
-# Clear the existing group and set up fresh
-g1 = displayio.Group(scale=1)
-cc = displayio.ColorConverter(input_colorspace=displayio.Colorspace.RGB565)
-tg1 = displayio.TileGrid(bitmap, pixel_shader=cc)
-g1.append(tg1)
-display.root_group = g1
+    for attempt in range(3):
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                timestring = response.json()['currentLocalTime']
+                timestring = timestring.split('.')[0]
+                local_rtc.datetime = adafruit_datetime.datetime.fromisoformat(timestring).timetuple()
+                debug_print(f"Updated time from API to: {timestring}")
+                return True
+            else:
+                debug_print(f"ISS API returned status code: {response.status_code}")
+        except Exception as e:
+            debug_print(f"Error fetching ISS position (attempt {attempt + 1}): {e}")
+            if not is_wifi_connected():
+                reconnect_wifi()
+            time.sleep(2)
+    return None
 
-# Get initial time
-if use_wifi:
-    print(f"Getting initial time from API")
-    get_time_from_api(requests)
+################################################################################
+# Main
 
-# After your display setup and before the main loop, set up the text label
-time_font = bitmap_font.load_font("/ArcadeNormal-8.bdf")
-time_text_area = label.Label(time_font, text="--:--", color=0x400000)
-time_text_area.x = 32 - (time_text_area.width // 2)  # Center horizontally
-time_text_area.y = 58  # Near bottom (64 - 6 pixels from bottom)
+def main():
+    # WiFi checker
+    last_wifi_check = 0
 
-# Add the text to your display group
-g1.append(time_text_area)
+    # ISS tracking variables
+    iss_lat = None
+    iss_lon = None
+    last_iss_update = 0
 
-# Force a display refresh to test if text is visible
-time_text_area.text = "12:34"
-time_text_area.x = 32 - (time_text_area.width // 2)
-display.refresh()
-print(f"Text area set to: {time_text_area.text}, position: ({time_text_area.x}, {time_text_area.y})")
+    # Time update variables
+    last_time_update = 0
+    last_time_display_update = 0
 
-# Perfomance tracking
-fps_sum = 0
-fps_start = supervisor.ticks_ms()
-last_print_time = 0
+    # Realtime clock
+    local_rtc = rtc.RTC()
 
-display.auto_refresh = False
+    # Hardware button setup
+    down_button = digitalio.DigitalInOut(board.BUTTON_DOWN)
+    down_button.direction = digitalio.Direction.INPUT
+    down_button.pull = digitalio.Pull.UP # Value False when button presed
+    up_button = digitalio.DigitalInOut(board.BUTTON_UP)
+    up_button.direction = digitalio.Direction.INPUT
+    up_button.pull = digitalio.Pull.UP # Value False when button presed
 
-# Main Loop
-while True:
-    # Timing stuff for FPS calculations
-    ticks = supervisor.ticks_ms()
-    delta = (ticks-fps_start)/1000
-    fps_start = ticks
+    # Display setup
+    displayio.release_displays()
 
-    if delta < 0 or delta > 1000:
-        delta = 0.016
+    # RGB Matrix initialization
+    matrix = rgbmatrix.RGBMatrix(
+        width=WIDTH, height=HEIGHT, bit_depth=5,
+        rgb_pins=[board.MTX_R1, board.MTX_G1, board.MTX_B1,
+                board.MTX_R2, board.MTX_G2, board.MTX_B2],
+        addr_pins=[board.MTX_ADDRA, board.MTX_ADDRB, board.MTX_ADDRC,
+                board.MTX_ADDRD, board.MTX_ADDRE],
+        clock_pin=board.MTX_CLK, latch_pin=board.MTX_LAT, output_enable_pin=board.MTX_OE,
+        doublebuffer=False)
 
-    # Update ISS position every minute
-    if use_wifi and (ticks - last_iss_update) > (iss_update_interval_sec * 1000):
-        iss_position = get_iss_position(requests)
-        if iss_position:
-            iss_lat, iss_lon = iss_position
-        last_iss_update = ticks
-        print(f"ISS lat: {iss_lat}, lon: {iss_lon}")
+    # Initialize display
+    display = framebufferio.FramebufferDisplay(matrix,auto_refresh=False, rotation=90) # Rotate 90 degrees so PCB pokes out of the top
+    display.brightness = 1 # Current implementation is 0 = off anything non-zero value = full brightness
 
-    # Update time from API every hour
-    if use_wifi and (ticks - last_time_update) > (time_update_interval_sec * 1000):
-        get_time_from_api(requests)
-        last_time_update = ticks
+    # Main "Full color" bitmap we use for drawing onto
+    bitmap = displayio.Bitmap(WIDTH,HEIGHT,65535)
+    cc = displayio.ColorConverter(input_colorspace=displayio.Colorspace.RGB565)
+    tg1 = displayio.TileGrid(bitmap,pixel_shader=cc)
+    g1 = displayio.Group(scale=1)
+    g1.append(tg1)
 
-    # Update time display on screen every second
-    if (ticks - last_time_display_update) > 1000:
-        current_time = local_rtc.datetime
-        time_string = f"{current_time.tm_hour:02}:{current_time.tm_min:02}"
-        time_text_area.text = time_string
-        time_text_area.x = 32 - (time_text_area.width // 2)
-        last_time_display_update = ticks
+    # Default palette for sprite mode - may get overwritten in special initialization
+    palette = displayio.Palette(256)
+    palette[0] = 0x0
+    palette[1] = 0xf80000
+    palette[2] = 0xf8f8f8
+    palette[3] = 0xf8
+    palette[4] = 0xf8f8
+    palette[5] = 0xf8c8e0
+    palette[6] = 0xf89800
+    palette[7] = 0xf8f800
+    palette[8] = 0x983800
+    palette[9] = 0xf800
+    palette[10] = 0xf8e0c0
+    palette[11] = 0xf8e860
+    palette[12] = 0xffff80
+    palette[13] = 0xff0000
+    palette[14] = 0xf8e0f8
+    palette.make_transparent(0)
 
-    # Clear the bitmap
-    bitmap.fill(0)
-    
-    # Copy the map to the bitmap as the base layer
-    if world_map_bitmap:
-        bitmaptools.blit(bitmap, world_map_bitmap, 0, 0)
+    # Palettized bitmap layer for sprite mode - in front of regular bitmap layer
+    palettized_bitmap = displayio.Bitmap(WIDTH,HEIGHT,256)
+    tg2 = displayio.TileGrid(palettized_bitmap,pixel_shader=palette)
+    #g1.append(tg2) # Comment this line out if not using this layer (for faster updates)
 
-    # Draw ISS position if we have it
-    if iss_lat is not None and iss_lon is not None:
-        # Convert lat/lon to x/y on the mercator projection map
-        x, y = latlon_to_pixel(iss_lat, iss_lon)
-
-        # Optional: draw a small cross hair
-        bitmaptools.draw_line(bitmap, x-1, y, x+1, y, 0x0800)
-        bitmaptools.draw_line(bitmap, x, y-1, x, y+1, 0x0800)
-
-        # Draw a bright red circle for the ISS
-        bitmap[x, y] = 0xF800
-
-    # Update the display
+    # Set root display object
+    display.root_group = g1
     display.refresh()
-    
-    # FPS tracking
-    fps_sum += 1
-    if ticks - last_print_time > 1000:
-        # print(f"FPS: {fps_sum}")
-        fps_sum = 0
-        last_print_time = ticks
+
+    # Perfomance tracking
+    fps_sum = 0
+    fps_samples = 0
+    fps_start = -1
+    last_print_time = 0
+    last_fps = 0
+
+    # We want to control when the screen updates
+    display.auto_refresh = False
+    display.refresh()
+
+    # Load the world map image
+    try:
+        world_map_bitmap, world_map_palette = adafruit_imageload.load("/world_map.png",
+                                                                        bitmap=displayio.Bitmap,
+                                                                        palette=displayio.Palette)
+        debug_print("World map loaded successfully")
+    except Exception as e:
+        debug_print(f"Error loading world map: {e}")
+        world_map_bitmap = None
+
+    # Perfomance tracking
+    fps_sum = 0
+    fps_start = supervisor.ticks_ms()
+    last_print_time = 0
+
+    # Connect to the Internet
+    debug_print(f"My MAC address: {[hex(i) for i in wifi.radio.mac_address]}") # show our MAC
+
+    # Show which WiFi networks we can see (comment this back in to survey the wifi in your area)
+    # wifi.radio.stop_scanning_networks()
+    # for network in wifi.radio.start_scanning_networks():
+    #     debug_print("\t%s\t\tRSSI: %d\tChannel: %d" % (str(network.ssid, "utf-8"),
+    #                                              network.rssi, network.channel))
+    # wifi.radio.stop_scanning_networks() # stop scanning
+
+    # Connect the specified access point in the TOML file
+    debug_print( f"WiFi Connecting to {os.getenv("CIRCUITPY_WIFI_SSID")}" )
+    try:
+        wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"),os.getenv("CIRCUITPY_WIFI_PASSWORD"))
+    except Exception as e:
+        debug_print(f"Could not connect to {os.getenv("CIRCUITPY_WIFI_SSID")}" )
+        
+    # Set up objects so we can do Web API requests
+    pool = socketpool.SocketPool(wifi.radio)
+    requests = adafruit_requests.Session(pool, ssl.create_default_context())
+
+    # Grab the current time via the timeapi.io API (set a timeout so we don't wait forever)
+    debug_print( f"CircuitPython thinks the time/date is {adafruit_datetime.datetime.today()}\nGetting time from API" )
+    try:
+        response = requests.request("GET", "https://www.timeapi.io/api/timezone/zone?timeZone=America%2FLos_Angeles", timeout=2 )
+        """ example response
+        {
+        "timeZone": "America/Los_Angeles",
+        "currentLocalTime": "2025-08-18T17:15:28.519488",
+        ...
+        }
+        """
+        if response.status_code == 200:
+            debug_print("Got time from API - Parsing")
+            # parse the JSON
+        #    debug_print( f"Response was:\n{response.json()}" )
+            timestring = response.json()['currentLocalTime']
+            # knock off the fractional seconds to prevent exceptions in the parser
+            timestring = timestring.split('.')[0]
+            local_rtc.datetime = adafruit_datetime.datetime.fromisoformat(timestring).timetuple() # Convert to actual datetime object and set the controller's time
+            debug_print( f"Updating local timesource to {timestring}" )
+        else:
+            debug_print("Get response was {response}")
+    except Exception as e:
+        debug_print(f"API check failed {e}")
+
+    # Use the main bitmap for drawing
+    # Clear the existing group and set up fresh
+    g1 = displayio.Group(scale=1)
+    cc = displayio.ColorConverter(input_colorspace=displayio.Colorspace.RGB565)
+    tg1 = displayio.TileGrid(bitmap, pixel_shader=cc)
+    g1.append(tg1)
+    display.root_group = g1
+
+    # Get initial time
+    debug_print(f"Getting initial time from API")
+    get_time_from_api(requests, local_rtc)
+
+    # After your display setup and before the main loop, set up the text label
+    time_font = bitmap_font.load_font("/ArcadeNormal-8.bdf")
+    time_text_area = label.Label(time_font, text="--:--", color=0x400000)
+    time_text_area.x = 32 - (time_text_area.width // 2)  # Center horizontally
+    time_text_area.y = 58  # Near bottom (64 - 6 pixels from bottom)
+
+    # Add the text to your display group
+    g1.append(time_text_area)
+
+    # Force a display refresh to test if text is visible
+    time_text_area.text = "12:34"
+    time_text_area.x = 32 - (time_text_area.width // 2)
+    display.refresh()
+    debug_print(f"Text area set to: {time_text_area.text}, position: ({time_text_area.x}, {time_text_area.y})")
+
+    display.auto_refresh = False
+
+    # Main Loop
+    while True:
+        # Timing stuff for FPS calculations
+        ticks = supervisor.ticks_ms()
+        delta = (ticks - fps_start) / 1000
+        fps_start = ticks
+
+        if delta < 0 or delta > 1000:
+            delta = 0.016
+
+        # Check for WiFi (and reconnect if needed)
+        if (ticks - last_wifi_check) > (WIFI_CHECK_INTERVAL_SEC * 1000):
+            if not is_wifi_connected():
+                debug_print("Wi-Fi connection lost — reconnecting.")
+                reconnect_wifi()
+            wifi_check_timer = ticks
+
+        # Update ISS position every minute
+        if (ticks - last_iss_update) > (ISS_UPDATE_INTERVAL_SEC * 1000):
+            iss_position = get_iss_position(requests)
+            if iss_position:
+                iss_lat, iss_lon = iss_position
+            last_iss_update = ticks
+            debug_print(f"ISS lat: {iss_lat}, lon: {iss_lon}")
+
+        # Update time from API every hour
+        if (ticks - last_time_update) > (TIME_UPDATE_INTERVAL_SEC * 1000):
+            debug_print("Requesting time update")
+            get_time_from_api(requests)
+            last_time_update = ticks
+
+        # Update time display on screen every second
+        if (ticks - last_time_display_update) > 1000:
+            current_time = local_rtc.datetime
+            time_string = f"{current_time.tm_hour:02}:{current_time.tm_min:02}"
+            time_text_area.text = time_string
+            time_text_area.x = 32 - (time_text_area.width // 2)
+            last_time_display_update = ticks
+
+        # Clear the bitmap
+        bitmap.fill(0)
+        
+        # Copy the map to the bitmap as the base layer
+        if world_map_bitmap:
+            bitmaptools.blit(bitmap, world_map_bitmap, 0, 0)
+
+        # Draw ISS position if we have it
+        if iss_lat is not None and iss_lon is not None:
+            # Convert lat/lon to x/y on the mercator projection map
+            x, y = latlon_to_pixel(iss_lat, iss_lon)
+
+            # Optional: draw a small cross hair
+            bitmaptools.draw_line(bitmap, x-1, y, x+1, y, 0x0800)
+            bitmaptools.draw_line(bitmap, x, y-1, x, y+1, 0x0800)
+
+            # Draw a bright red circle for the ISS
+            bitmap[x, y] = 0xF800
+
+        # Update the display
+        display.refresh()
+        
+        # FPS tracking
+        fps_sum += 1
+        if ticks - last_print_time > 1000:
+            # debug_print(f"FPS: {fps_sum}")
+            fps_sum = 0
+            last_print_time = ticks
+
+# Entrypoint: call main
+if __name__ == "__main__":
+    main()
