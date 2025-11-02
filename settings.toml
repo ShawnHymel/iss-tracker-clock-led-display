@@ -1,0 +1,2 @@
+CIRCUITPY_WIFI_SSID = "Supercon"
+CIRCUITPY_WIFI_PASSWORD = "whatpassword"
