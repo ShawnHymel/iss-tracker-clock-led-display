@@ -40,6 +40,7 @@ HEIGHT = 64
 WIFI_CHECK_INTERVAL_SEC = 120
 ISS_UPDATE_INTERVAL_SEC = 60
 TIME_UPDATE_INTERVAL_SEC = 3600
+AUTO_REFRESH = False
 
 ################################################################################
 # Functions
@@ -63,14 +64,14 @@ def reconnect_wifi(max_retries=3, delay=5):
     """Attempt to reconnect to Wi-Fi if disconnected."""
     for attempt in range(1, max_retries + 1):
         try:
-            print(f"Reconnecting Wi-Fi (attempt {attempt})...")
+            debug_print(f"Reconnecting Wi-Fi (attempt {attempt})...")
             wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"), os.getenv("CIRCUITPY_WIFI_PASSWORD"))
-            print("Reconnected:", wifi.radio.ipv4_address)
+            debug_print("Reconnected:", wifi.radio.ipv4_address)
             return True
         except Exception as e:
-            print("Reconnect failed:", e)
+            debug_print("Reconnect failed:", e)
             time.sleep(delay)
-    print("Failed to reconnect after multiple attempts.")
+    debug_print("Failed to reconnect after multiple attempts.")
     return False
 
 def get_iss_position(requests):
@@ -198,7 +199,11 @@ def main():
         doublebuffer=False)
 
     # Initialize display
-    display = framebufferio.FramebufferDisplay(matrix,auto_refresh=False, rotation=90) # Rotate 90 degrees so PCB pokes out of the top
+    display = framebufferio.FramebufferDisplay(
+        matrix,
+        auto_refresh=AUTO_REFRESH,
+        rotation=90,
+    )    
     display.brightness = 1 # Current implementation is 0 = off anything non-zero value = full brightness
 
     # Main "Full color" bitmap we use for drawing onto
@@ -234,7 +239,7 @@ def main():
 
     # Set root display object
     display.root_group = g1
-    display.refresh()
+    # display.refresh()
 
     # Perfomance tracking
     fps_sum = 0
@@ -242,10 +247,6 @@ def main():
     fps_start = -1
     last_print_time = 0
     last_fps = 0
-
-    # We want to control when the screen updates
-    display.auto_refresh = False
-    display.refresh()
 
     # Load the world map image
     try:
@@ -332,10 +333,8 @@ def main():
     # Force a display refresh to test if text is visible
     time_text_area.text = "12:34"
     time_text_area.x = 32 - (time_text_area.width // 2)
-    display.refresh()
+    # display.refresh()
     debug_print(f"Text area set to: {time_text_area.text}, position: ({time_text_area.x}, {time_text_area.y})")
-
-    display.auto_refresh = False
 
     # Main Loop
     while True:
@@ -349,13 +348,15 @@ def main():
 
         # Check for WiFi (and reconnect if needed)
         if (ticks - last_wifi_check) > (WIFI_CHECK_INTERVAL_SEC * 1000):
+            debug_print("Performing WiFi check")
             if not is_wifi_connected():
-                debug_print("Wi-Fi connection lost — reconnecting.")
+                debug_print("WiFi connection lost. Reconnecting.")
                 reconnect_wifi()
-            wifi_check_timer = ticks
+            last_wifi_check = ticks
 
         # Update ISS position every minute
         if (ticks - last_iss_update) > (ISS_UPDATE_INTERVAL_SEC * 1000):
+            debug_print("Requesting ISS location")
             iss_position = get_iss_position(requests)
             if iss_position:
                 iss_lat, iss_lon = iss_position
@@ -365,7 +366,7 @@ def main():
         # Update time from API every hour
         if (ticks - last_time_update) > (TIME_UPDATE_INTERVAL_SEC * 1000):
             debug_print("Requesting time update")
-            get_time_from_api(requests)
+            get_time_from_api(requests, local_rtc)
             last_time_update = ticks
 
         # Update time display on screen every second
@@ -395,15 +396,20 @@ def main():
             # Draw a bright red circle for the ISS
             bitmap[x, y] = 0xF800
 
-        # Update the display
-        display.refresh()
+        # Manually update the display
+        if not display.auto_refresh:
+            display.refresh()
         
         # FPS tracking
         fps_sum += 1
         if ticks - last_print_time > 1000:
-            # debug_print(f"FPS: {fps_sum}")
+            debug_print(f"FPS: {fps_sum}")
             fps_sum = 0
             last_print_time = ticks
+
+        # Delay if we're auto-refreshing
+        if display.auto_refresh:
+            time.sleep(0.05)
 
 # Entrypoint: call main
 if __name__ == "__main__":
